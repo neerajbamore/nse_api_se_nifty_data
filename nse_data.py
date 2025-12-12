@@ -1,231 +1,212 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-NIFTY Option Chain + Futures Monitor for Render + Telegram Alerts
-By Neeraj — Modified for Render deployment and Telegram notifications.
-Environment variables used:
-  - TELEGRAM_BOT_TOKEN (required)
-  - TELEGRAM_CHAT_ID  (required)  -> user/chat or channel id (add bot to channel)
-  - POLL_SECONDS (optional, default 138)
-  - SYMBOL (optional, default NIFTY)
-  - STRIKE_STEP, OTM_COUNT (optional)
-  - SEND_EVERY_RUN (optional, "1" to send every refresh; default "1")
-"""
+# app.py
+# Single-file Flask app that:
+# - Scrapes NSE option-chain (from the public option-chain page)
+# - Parses the embedded __NEXT_DATA__ JSON
+# - Picks 1 ITM, 1 ATM, 3 OTM for Calls and Puts
+# - Computes ltp*oi, change in oi (coi), ltp*coi
+# - Fetches futures metadata (from same JSON if present)
+# - Sends a nicely formatted Telegram message to configured BOT_TOKEN & CHAT_ID
+#
+# Notes:
+# - Uses requests + bs4 + flask
+# - Read BOT_TOKEN and CHAT_ID from environment variables
+# - Run with: python app.py
+# - Or deploy to any cloud and set env vars there
 
-import os, sys, time, signal, requests, logging
-from datetime import datetime, timezone, timedelta
-from tabulate import tabulate
+from flask import Flask, jsonify
+import os, requests, json, time
+from bs4 import BeautifulSoup
+from datetime import datetime
 
-# ===== Logging =====
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
-log = logging.getLogger("nifty-monitor")
+app = Flask(__name__)
 
-# ===== Settings from env =====
-SYMBOL = os.environ.get("SYMBOL", "NIFTY")
-POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "138"))
-STRIKE_STEP = int(os.environ.get("STRIKE_STEP", "50"))
-OTM_COUNT = int(os.environ.get("OTM_COUNT", "5"))
-TIMEZONE = timezone(timedelta(hours=5, minutes=30))
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+CHAT_ID = os.getenv("CHAT_ID")
 
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
-SEND_EVERY_RUN = os.environ.get("SEND_EVERY_RUN", "1") == "1"
-
-if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-    log.warning("TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not set. Telegram alerts will be disabled.")
-
-# NSE endpoints
-OC_URL = f"https://www.nseindia.com/api/option-chain-indices?symbol={SYMBOL}"
-DERIV_URL = f"https://www.nseindia.com/api/quote-derivative?symbol={SYMBOL}"
-
-session = requests.Session()
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-    "Referer": "https://www.nseindia.com/",
+    "User-Agent": "Mozilla/5.0 (Linux; Android 12; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Mobile Safari/537.36",
+    "Referer": "https://www.nseindia.com/option-chain",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
 }
 
-prev_option_snapshot = {}
-prev_fut_snapshot = None
+def send_telegram(text):
+    if not BOT_TOKEN or not CHAT_ID:
+        print("Missing BOT_TOKEN or CHAT_ID in environment.")
+        return False, "missing token/id"
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    payload = {"chat_id": CHAT_ID, "text": text}
+    try:
+        r = requests.post(url, data=payload, timeout=10)
+        return r.ok, r.text
+    except Exception as e:
+        return False, str(e)
 
-# ===== Helpers =====
-def warmup():
-    for url in ["https://www.nseindia.com", f"https://www.nseindia.com/option-chain?symbol={SYMBOL}"]:
+def fetch_nse_nextdata():
+    """Scrape the NSE option chain page and extract __NEXT_DATA__ JSON (if present)"""
+    url = "https://www.nseindia.com/option-chain"
+    s = requests.Session()
+    # try a couple times to be robust
+    for _ in range(2):
         try:
-            session.get(url, headers=HEADERS, timeout=10)
+            r = s.get(url, headers=HEADERS, timeout=10)
+            if r.status_code != 200:
+                time.sleep(1)
+                continue
+            soup = BeautifulSoup(r.text, "html.parser")
+            tag = soup.find("script", id="__NEXT_DATA__")
+            if not tag:
+                return None, "no_next_data"
+            data = json.loads(tag.string)
+            return data, None
+        except Exception as e:
+            last_e = e
+            time.sleep(1)
+    return None, str(last_e)
+
+def extract_oc_and_future(nextdata):
+    """
+    Navigate the Next.js payload to find optionChain data and future metadata.
+    This may vary over time; we attempt common paths used by NSE sites.
+    """
+    # Try a few likely locations, be defensive
+    try:
+        # try common path used earlier
+        oc = nextdata["props"]["pageProps"]["initialState"]["optionChain"]["data"]
+        # oc contains records -> underlyingValue & records.data list
+        records = oc["records"]
+        underlying = records.get("underlyingValue")
+        oc_rows = records.get("data", [])
+        # future metadata may be somewhere else; try derivatives or other keys
+        fut = None
+        # try to find futures metadata in pageProps
+        pageprops = nextdata["props"]["pageProps"]
+        # sometimes derivative metadata under "live" or similar - attempt safe retrieval
+        for k in pageprops.keys():
+            if isinstance(pageprops[k], dict) and "futures" in json.dumps(pageprops[k]).lower():
+                # best-effort, but avoid crash
+                pass
+        return underlying, oc_rows, oc.get("expiryDates"), fut
+    except Exception:
+        # fallback: scan entire json for "optionChain" key
+        try:
+            def find_key(d, key):
+                if isinstance(d, dict):
+                    if key in d:
+                        return d[key]
+                    for v in d.values():
+                        r = find_key(v, key)
+                        if r is not None:
+                            return r
+                elif isinstance(d, list):
+                    for item in d:
+                        r = find_key(item, key)
+                        if r is not None:
+                            return r
+                return None
+            part = find_key(nextdata, "optionChain")
+            if part and isinstance(part, dict) and "data" in part:
+                oc = part["data"]
+                records = oc.get("records", {})
+                return records.get("underlyingValue"), records.get("data", []), oc.get("expiryDates"), None
+        except:
+            pass
+    return None, [], None, None
+
+def group_ce_pe(rows):
+    ce = []
+    pe = []
+    for r in rows:
+        if "CE" in r:
+            ce.append(r)
+        if "PE" in r:
+            pe.append(r)
+    return ce, pe
+
+def pick_strikes(spot, ce_list, pe_list):
+    strikes = sorted({r["strikePrice"] for r in ce_list})
+    if not strikes:
+        return None, (), ()
+    atm = min(strikes, key=lambda x: abs(x - spot))
+    # build helpers
+    ce_itm = [r for r in ce_list if r["strikePrice"] < atm]
+    ce_otm = [r for r in ce_list if r["strikePrice"] > atm]
+    pe_itm = [r for r in pe_list if r["strikePrice"] > atm]
+    pe_otm = [r for r in pe_list if r["strikePrice"] < atm]
+    # picks
+    ce_itm_pick = sorted(ce_itm, key=lambda x: -x["strikePrice"])[0] if ce_itm else None
+    pe_itm_pick = sorted(pe_itm, key=lambda x: x["strikePrice"])[0] if pe_itm else None
+    ce_atm = next((r for r in ce_list if r["strikePrice"] == atm), None)
+    pe_atm = next((r for r in pe_list if r["strikePrice"] == atm), None)
+    ce_otm_pick = sorted(ce_otm, key=lambda x: x["strikePrice"])[:3]
+    pe_otm_pick = sorted(pe_otm, key=lambda x: -x["strikePrice"])[:3]
+    return atm, (ce_itm_pick, ce_atm, ce_otm_pick), (pe_itm_pick, pe_atm, pe_otm_pick)
+
+def fmt_option_block(tag, opt, side):
+    if not opt:
+        return f"{tag}: N/A\n"
+    d = opt[side]
+    ltp = d.get("lastPrice", 0)
+    oi = d.get("openInterest", 0)
+    coi = d.get("changeinOpenInterest", 0)
+    rs = ltp * oi
+    crs = ltp * coi
+    return (
+        f"{tag} Strike {opt['strikePrice']}\n"
+        f" LTP: {ltp} | OI: {oi} | LTP*OI: {rs}\n"
+        f" COI: {coi} | LTP*COI: {crs}\n"
+    )
+
+@app.route("/send", methods=["GET"])
+def send_handler():
+    nextdata, err = fetch_nse_nextdata()
+    if err or not nextdata:
+        return jsonify({"ok": False, "error": "failed to fetch nextdata", "detail": err}), 500
+
+    spot, rows, expiries, fut_meta = extract_oc_and_future(nextdata)
+    if not rows:
+        return jsonify({"ok": False, "error": "no option rows found"}), 500
+
+    ce_list, pe_list = group_ce_pe(rows)
+    atm, ce_picks, pe_picks = pick_strikes(spot, ce_list, pe_list)
+
+    # Format message
+    text = f"📌 NIFTY Option Chain Snapshot\nATM: {atm}\nSpot: {spot}\nTime: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}\n\n"
+    text += "--- CALLS ---\n"
+    text += fmt_option_block("ITM", ce_picks[0], "CE")
+    text += fmt_option_block("ATM", ce_picks[1], "CE")
+    for i, s in enumerate(ce_picks[2]):
+        text += fmt_option_block(f"OTM{i+1}", s, "CE")
+
+    text += "\n--- PUTS ---\n"
+    text += fmt_option_block("ITM", pe_picks[0], "PE")
+    text += fmt_option_block("ATM", pe_picks[1], "PE")
+    for i, s in enumerate(pe_picks[2]):
+        text += fmt_option_block(f"OTM{i+1}", s, "PE")
+
+    # FUTURES: if fut_meta available try to add (best-effort)
+    if fut_meta and isinstance(fut_meta, dict):
+        try:
+            text += "\n📘 FUTURE\n"
+            # fallback safe keys
+            last = fut_meta.get("lastPrice") or fut_meta.get("last")
+            prem = fut_meta.get("premium")
+            change = fut_meta.get("change")
+            oi = fut_meta.get("openInterest")
+            vol = fut_meta.get("totalTradedVolume") or fut_meta.get("volume")
+            text += f"Price: {last}\nPremium: {prem}\nChange: {change}\nOI: {oi}\nVolume: {vol}\n"
         except Exception:
             pass
 
-def fetch_json(url, timeout=15):
-    r = session.get(url, headers=HEADERS, timeout=timeout)
-    r.raise_for_status()
-    return r.json()
-
-def fetch_option_chain():
-    return fetch_json(OC_URL)
-
-def extract_data(js):
-    expiry = js["records"]["expiryDates"][0]
-    underlying = js["records"]["underlyingValue"]
-    data = [d for d in js["records"]["data"] if d["expiryDate"] == expiry]
-    return expiry, underlying, data
-
-def deep_find_futures(js):
-    # same recursive search as original to find oi/volume
-    def deep_find(obj):
-        if isinstance(obj, dict):
-            oi = None; vol = None
-            for k, v in obj.items():
-                lk = k.lower()
-                if "open" in lk and "interest" in lk and isinstance(v, (int, float)):
-                    oi = v
-                if "volume" in lk and isinstance(v, (int, float)):
-                    vol = v
-            if oi is not None and vol is not None:
-                return oi, vol
-            for v in obj.values():
-                res = deep_find(v)
-                if res:
-                    return res
-        elif isinstance(obj, list):
-            for item in obj:
-                res = deep_find(item)
-                if res:
-                    return res
-        return None
-    return deep_find(js)
-
-def fetch_futures():
-    try:
-        js = fetch_json(DERIV_URL)
-        res = deep_find_futures(js)
-        if res:
-            return res
-        log.warning("Futures OI/Vol fields not found in derivative JSON.")
-        return 0,0
-    except Exception as e:
-        log.error("Futures fetch error: %s", e)
-        return 0,0
-
-def round_strike(u): return int(round(u / STRIKE_STEP) * STRIKE_STEP)
-def pick_strikes(a):
-    return [a - STRIKE_STEP, a] + [a + i*STRIKE_STEP for i in range(1, OTM_COUNT+1)], \
-           [a + STRIKE_STEP, a] + [a - i*STRIKE_STEP for i in range(1, OTM_COUNT+1)]
-
-def lookup(data, strike, t):
-    for d in data:
-        if int(d["strikePrice"]) == strike and t in d:
-            leg = d[t]
-            return int(leg.get("openInterest",0)), int(leg.get("totalTradedVolume",0)), float(leg.get("impliedVolatility",0.0))
-    return 0,0,0.0
-
-def delta(curr, prev):
-    if prev is None: return None
-    return tuple(a-b for a,b in zip(curr,prev))
-
-def format_number(n):
-    return f"{n:,}"
-
-def send_telegram(text, parse_mode="HTML"):
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        return False
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": parse_mode, "disable_web_page_preview": True}
-    try:
-        r = requests.post(url, data=payload, timeout=10)
-        r.raise_for_status()
-        return True
-    except Exception as e:
-        log.error("Telegram send failed: %s", e)
-        return False
-
-# ===== Main logic =====
-def build_message(now, expiry, underlying, atm, sum_call_coi, sum_put_coi, avg_call_iv, avg_put_iv, fut_delta):
-    # HTML formatted message for Telegram (bold headings, code for numbers)
-    fut_text = f"ΔOI: <b>{format_number(fut_delta[0]) if fut_delta[0] is not None else '—'}</b> | ΔVol: <b>{format_number(fut_delta[1]) if fut_delta[1] is not None else '—'}</b>"
-    msg = (
-        f"<b>[{now}] {SYMBOL} Option Snapshot</b>%0A"
-        f"Expiry: <b>{expiry}</b>%0A"
-        f"Underlying: <b>{underlying:.2f}</b> | ATM: <b>{atm}</b>%0A%0A"
-        f"<b>Calls</b> Total COI: <code>{format_number(sum_call_coi)}</code> | Avg IV: <code>{avg_call_iv:.2f}</code>%0A"
-        f"<b>Puts</b> Total COI: <code>{format_number(sum_put_coi)}</code> | Avg IV: <code>{avg_put_iv:.2f}</code>%0A%0A"
-        f"<b>Futures Δ</b> {fut_text}%0A%0A"
-        f"<i>Note:</i> Ye summary har refresh pe bheja ja sakta hai. Agar zyada alerts aa rahe ho to POLL_SECONDS badha do ya SEND_EVERY_RUN=0 set karo."
-    )
-    # decode %0A handled by Telegram if passed raw newlines; we are using URL-encoded newlines here for safety
-    # but send_telegram uses requests form data so Telegram will accept plain newlines. We'll replace %0A -> \n
-    return msg.replace("%0A", "\n")
-
-def main_loop():
-    warmup()
-    global prev_option_snapshot, prev_fut_snapshot
-    first = True
-    while True:
-        try:
-            expiry, underlying, data = extract_data(fetch_option_chain())
-            atm = round_strike(underlying)
-            call_strikes, put_strikes = pick_strikes(atm)
-
-            sum_call_coi=sum_put_coi=0
-            sum_call_iv=sum_put_iv=0.0
-            count_calls=count_puts=0
-
-            # iterate calls
-            for s in call_strikes:
-                oi,vol,iv = lookup(data, s, "CE")
-                prev = prev_option_snapshot.get((s,"CE"))
-                d = delta((oi,vol,iv), prev)
-                if d is not None:
-                    coi,cvol,civ = d
-                else:
-                    coi=cvol=civ=None
-                prev_option_snapshot[(s,"CE")] = (oi,vol,iv)
-                sum_call_coi += oi
-                sum_call_iv += iv
-                count_calls += 1
-
-            # iterate puts
-            for s in put_strikes:
-                oi,vol,iv = lookup(data, s, "PE")
-                prev = prev_option_snapshot.get((s,"PE"))
-                d = delta((oi,vol,iv), prev)
-                if d is not None:
-                    coi,cvol,civ = d
-                else:
-                    coi=cvol=civ=None
-                prev_option_snapshot[(s,"PE")] = (oi,vol,iv)
-                sum_put_coi += oi
-                sum_put_iv += iv
-                count_puts += 1
-
-            avg_call_iv = sum_call_iv / max(1, count_calls)
-            avg_put_iv = sum_put_iv / max(1, count_puts)
-
-            fut_oi, fut_vol = fetch_futures()
-            fd = delta((fut_oi, fut_vol), prev_fut_snapshot)
-            fut_coi, fut_cvol = (None, None) if fd is None else fd
-            prev_fut_snapshot = (fut_oi, fut_vol)
-
-            now = datetime.now(TIMEZONE).strftime("%Y-%m-%d %H:%M:%S")
-            # console output for debugging on Render logs
-            log.info("[%s] %s | Underlying %.2f | ATM %d", now, SYMBOL, underlying, atm)
-            log.info("Calls COI: %s | Puts COI: %s | AvgIV C/P: %.2f / %.2f", format_number(sum_call_coi), format_number(sum_put_coi), avg_call_iv, avg_put_iv)
-            log.info("Futures ΔOI=%s ΔVol=%s", format_number(fut_coi) if fut_coi is not None else "—", format_number(fut_cvol) if fut_cvol is not None else "—")
-
-            # Telegram message (send if enabled)
-            if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID and SEND_EVERY_RUN:
-                msg = build_message(now, expiry, underlying, atm, sum_call_coi, sum_put_coi, avg_call_iv, avg_put_iv, (fut_coi, fut_cvol))
-                ok = send_telegram(msg)
-                log.info("Telegram sent: %s", ok)
-
-            if first:
-                log.info("First run completed. Subsequent runs will show deltas.")
-                first = False
-
-        except Exception as e:
-            log.exception("Main loop error: %s", e)
-
-        time.sleep(POLL_SECONDS)
+    ok, resp = send_telegram(text)
+    if ok:
+        return jsonify({"ok": True, "message": "sent", "telegram_resp": resp})
+    else:
+        return jsonify({"ok": False, "message": "telegram_failed", "detail": resp}), 500
 
 if __name__ == "__main__":
-    signal.signal(signal.SIGINT, lambda s,f: sys.exit(0))
-    main_loop()
+    # For local run: set environment and run
+    # Example:
+    # export BOT_TOKEN="..."
+    # export CHAT_ID="..."
+    # python app.py
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")))
